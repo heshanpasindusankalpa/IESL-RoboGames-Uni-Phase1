@@ -1,11 +1,12 @@
 import time
 import socket
 import struct
-from states import DroneState
 import numpy as np
 import cv2
 from pymavlink import mavutil
+from states import DroneState
 import controls
+import vision
 
 # Establish connections
 master = mavutil.mavlink_connection('udp:0.0.0.0:14550')
@@ -58,8 +59,10 @@ while True:
 
     payload = recv_exact(cam_sock, width * height)
     img = np.frombuffer(payload, dtype=np.uint8).reshape((height, width))
+    m = vision.detect_line(img)
+    vis = vision.draw_debug(img, m)
 
-    cv2.imshow("Webots Camera", img)
+    cv2.imshow("Webots Camera", vis)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 

@@ -1,4 +1,3 @@
-import time
 from pymavlink import mavutil
 
 def force_arm(master): 
