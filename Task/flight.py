@@ -52,14 +52,17 @@ def recv_exact(sock, nbytes: int) -> bytes:
 
 current_state = DroneState.INITIALIZING
 
+ARM_TIMEOUT_S = 5.0
+arm_requested_at = None
+last_img = None
+last_frame_t = 0.0
 TARGET_ALT = 2.0 # meters
 ALT_TOL = 0.2 # meters
 TAKEOFF_TIMEOUT_S = 20.0
 alt_tracker = controls.AltitudeTracker()
 takeoff_started_at = None
-
-last_img = None
-last_frame_t = 0.0
+HOVER_STABILIZE_S = 2.0
+hover_started_at = None
 
 while True:
     try:
@@ -86,10 +89,18 @@ while True:
 
     if current_state == DroneState.INITIALIZING:
         set_mode('GUIDED')
-        if controls.force_arm(master):
+        if arm_requested_at is None:
+            controls.force_arm(master)
+            arm_requested_at = time.time()
+            print("Arm requested...")
+        
+        if controls.is_armed(master):
+            print("Armed ✅")
             current_state = DroneState.ARMED
         else:
-            current_state = DroneState.INITIALIZING
+            if (time.time() - arm_requested_at > ARM_TIMEOUT_S):
+                print("Arming FAILED (timeout)")
+                arm_requested_at = None
 
     if current_state == DroneState.ARMED:
         controls.takeoff(master, TARGET_ALT)
@@ -114,10 +125,9 @@ while True:
             if reached:
                 print("Reached target altitude — entering HOVER")
                 current_state = DroneState.HOVER
+                hover_started_at = time.time()
 
     if current_state == DroneState.HOVER:
-        time.sleep(5)
-        current_state = DroneState.LANDING
-        print("Landing")
-        set_mode('LAND')
-        break
+        if (time.time() - hover_started_at >= HOVER_STABILIZE_S):
+            print("Hover stabilized — ready for FOLLOW_LINE_01")
+            current_state = DroneState.FOLLOW_LINE_01
