@@ -132,5 +132,10 @@ def draw_debug(gray_img, measurement, ref_color=(0, 0, 255), line_color=(0, 255,
     cv2.putText(vis_img, f"angle_err: {angle_deg:+.1f} deg", (20, 75),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 1)
     
+    # Draw ROI band
+    x0, x1 = measurement.get("roi", (None, None))
+    if x0 is not None:
+        cv2.rectangle(vis_img, (x0, 0), (x1, h-1), (80, 80, 80), 1)
+
     return vis_img
         

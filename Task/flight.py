@@ -10,6 +10,7 @@ import vision
 
 # Establish connections
 master = mavutil.mavlink_connection('udp:0.0.0.0:14550')
+# master = mavutil.mavlink_connection('tcp:127.0.0.1:5762')
 
 CAM_HOST = "127.0.0.1"
 CAM_PORT = 5599
@@ -100,5 +101,6 @@ while True:
     if current_state == DroneState.HOVER:
         time.sleep(5)
         current_state = DroneState.LANDING
+        print("Landing")
         set_mode('LAND')
         break
