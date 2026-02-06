@@ -1,4 +1,3 @@
-import time
 from pymavlink import mavutil
 
 def force_arm(master): 
@@ -11,9 +10,14 @@ def force_arm(master):
         21196,  # Force-arm magic number for ArduPilot
         0, 0, 0, 0, 0
     )
-    return True
 
-def takeoff(master, target_alt, tol):
+def is_armed(master) -> bool:
+    hb = master.recv_match(type='HEARTBEAT', blocking=False)
+    if not hb:
+        return False
+    return (hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED) != 0
+
+def takeoff(master, target_alt):
     master.mav.command_long_send(
         master.target_system,
         master.target_component,
