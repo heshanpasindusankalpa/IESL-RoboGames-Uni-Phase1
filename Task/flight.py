@@ -17,6 +17,7 @@ CAM_PORT = 5599
 
 cam_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 cam_sock.connect((CAM_HOST, CAM_PORT))
+cam_sock.settimeout(0.2)
 print("Connected to camera stream")
 
 # Wait for heartbeat to confirm connection
@@ -39,7 +40,10 @@ def set_mode(mode_name: str):
 def recv_exact(sock, nbytes: int) -> bytes:
     data = b""
     while len(data) < nbytes:
-        chunk = sock.recv(nbytes - len(data))
+        try:
+            chunk = sock.recv(nbytes - len(data))
+        except socket.timeout:
+            raise TimeoutError("Camera recv timeout")
         if not chunk:
             raise ConnectionError("Camera stream closed")
         data += chunk
@@ -54,12 +58,25 @@ TAKEOFF_TIMEOUT_S = 20.0
 alt_tracker = controls.AltitudeTracker()
 takeoff_started_at = None
 
-while True:
-    header = recv_exact(cam_sock, 4)
-    width, height = struct.unpack("<HH", header)
+last_img = None
+last_frame_t = 0.0
 
-    payload = recv_exact(cam_sock, width * height)
-    img = np.frombuffer(payload, dtype=np.uint8).reshape((height, width))
+while True:
+    try:
+        header = recv_exact(cam_sock, 4)
+        width, height = struct.unpack("<HH", header)
+        payload = recv_exact(cam_sock, width * height)
+        img = np.frombuffer(payload, dtype=np.uint8).reshape((height, width))
+        last_img = img
+        last_frame_t = time.time()
+    except TimeoutError:
+        img = last_img
+    except ConnectionError as e:
+        print(f"Camera error: {e}")
+        break
+    if img is None:
+        continue
+
     m = vision.detect_line(img)
     vis = vision.draw_debug(img, m)
 
