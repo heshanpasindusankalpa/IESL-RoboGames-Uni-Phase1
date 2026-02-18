@@ -64,6 +64,27 @@ takeoff_started_at = None
 HOVER_STABILIZE_S = 2.0
 hover_started_at = None
 
+# --- Line following ---
+FOLLOW_FWD_V = 0.8        # m/s forward cruise
+MAX_LAT_V = 0.6           # m/s
+MAX_YAW_RATE = 0.8        # rad/s
+CMD_HZ = 20.0             # command rate
+CMD_DT = 1.0 / CMD_HZ
+
+# PID: offset -> lateral velocity, angle -> yaw rate
+lat_pid = controls.PID(kp=0.9, ki=0.0, kd=0.15, out_limit=MAX_LAT_V, i_limit=0.5)
+yaw_pid = controls.PID(kp=1.8, ki=0.0, kd=0.25, out_limit=MAX_YAW_RATE, i_limit=0.8)
+
+# Smoothers
+off_lpf = controls.LowPass(alpha=0.25)
+ang_lpf = controls.LowPass(alpha=0.25)
+
+vx_slew = controls.SlewRateLimiter(rate_per_s=1.5)   # m/s per second
+vy_slew = controls.SlewRateLimiter(rate_per_s=1.2)
+yr_slew = controls.SlewRateLimiter(rate_per_s=2.0)   # rad/s per second
+
+last_cmd_t = 0.0
+
 while True:
     try:
         header = recv_exact(cam_sock, 4)
@@ -131,3 +152,47 @@ while True:
         if (time.time() - hover_started_at >= HOVER_STABILIZE_S):
             print("Hover stabilized — ready for FOLLOW_LINE_01")
             current_state = DroneState.FOLLOW_LINE_01
+
+    if current_state == DroneState.FOLLOW_LINE_01:
+        now = time.time()
+        if (now - last_cmd_t) < CMD_DT:
+            continue
+        dt = (now - last_cmd_t) if last_cmd_t > 0 else CMD_DT
+        last_cmd_t = now
+
+        h, w = img.shape[:2]
+
+        if not m.get("found", False):
+            # If line lost: slow forward, gently yaw to search 
+            vx_cmd = 0.2
+            vy_cmd = 0.0
+            yaw_rate_cmd = 0.35   # gentle spin to reacquire
+        else:
+            # Normalize offset: -1..+1 (left..right)
+            offset_px = (m["cx"] - (w / 2.0))
+            offset_n = offset_px / (w / 2.0)
+
+            ang_err = float(m["angle_error_rad"])
+
+            # Filter measurements
+            offset_n_f = off_lpf.update(offset_n)
+            ang_err_f = ang_lpf.update(ang_err)
+
+            # Controllers
+            vy_cmd = lat_pid.update(offset_n_f, dt)
+
+            yaw_rate_cmd = -yaw_pid.update(ang_err_f, dt)
+
+            # Forward speed scheduling (slow down when large error, for stability)
+            err_mag = min(1.0, abs(offset_n_f) + 0.6 * abs(ang_err_f))
+            vx_cmd = FOLLOW_FWD_V * (1.0 - 0.5 * err_mag)
+            if vx_cmd < 0.25:
+                vx_cmd = 0.25
+
+        # Slew-limit commands 
+        vx_cmd = vx_slew.update(vx_cmd, dt)
+        vy_cmd = vy_slew.update(vy_cmd, dt)
+        yaw_rate_cmd = yr_slew.update(yaw_rate_cmd, dt)
+
+        # Keep vz ~ 0 so autopilot holds altitude
+        controls.send_body_velocity(master, vx_cmd, vy_cmd, 0.0, yaw_rate_cmd)
