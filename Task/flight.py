@@ -1,4 +1,5 @@
 import time
+import math
 import socket
 import struct
 import numpy as np
@@ -31,8 +32,7 @@ def set_mode(mode_name: str):
     mode_id = modes[mode_name]
     master.mav.set_mode_send(
         master.target_system,
-        mavutil.mavlink.
-        MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
         mode_id
     )
 
@@ -49,6 +49,10 @@ def recv_exact(sock, nbytes: int) -> bytes:
         data += chunk
     return data
 
+def wrap_pi(a):
+    while a > math.pi: a -= 2*math.pi
+    while a < -math.pi: a += 2*math.pi
+    return a
 
 current_state = DroneState.INITIALIZING
 
@@ -85,6 +89,34 @@ yr_slew = controls.SlewRateLimiter(rate_per_s=2.0)   # rad/s per second
 
 last_cmd_t = 0.0
 
+# --- AprilTag hover ---
+TAG_MAX_LAT_V = 0.4
+TAG_MAX_FWD_V = 0.4
+TAG_MAX_YAW_RATE = 0.6
+
+tag_x_pid = controls.PID(kp=0.8, ki=0.0, kd=0.12, out_limit=TAG_MAX_LAT_V, i_limit=0.4)  
+tag_y_pid = controls.PID(kp=0.8, ki=0.0, kd=0.12, out_limit=TAG_MAX_FWD_V, i_limit=0.4) 
+
+tag_x_lpf = controls.LowPass(alpha=0.25)
+tag_y_lpf = controls.LowPass(alpha=0.25)
+
+tag_hover_good = 0
+TAG_HOVER_NEED = 15         
+TAG_CENTER_TOL = 0.06      
+
+last_seen_tag = None
+last_tag_t = 0.0
+last_turn_t = 0.0
+
+tag_vx_slew = controls.SlewRateLimiter(rate_per_s=0.8)
+tag_vy_slew = controls.SlewRateLimiter(rate_per_s=0.8)
+tag_yr_slew = controls.SlewRateLimiter(rate_per_s=1.5)
+
+# --- Turn tracking ---
+turn_started = False
+turn_start_yaw = None
+turn_target_yaw = None
+
 while True:
     try:
         header = recv_exact(cam_sock, 4)
@@ -102,6 +134,7 @@ while True:
         continue
 
     m = vision.detect_line(img)
+    tag = vision.detect_apriltag(img)
     vis = vision.draw_debug(img, m)
 
     cv2.imshow("Webots Camera", vis)
@@ -154,45 +187,131 @@ while True:
             current_state = DroneState.FOLLOW_LINE_01
 
     if current_state == DroneState.FOLLOW_LINE_01:
-        now = time.time()
-        if (now - last_cmd_t) < CMD_DT:
+        # 1) Transition ASAP if tag appears (no 20Hz gate)
+        if tag.get("found", False):
+            last_seen_tag = tag
+            print(f"AprilTag seen while following line: id={tag['id']}")
+            current_state = DroneState.APRILTAG_01_DETECTED
+            controls.send_body_velocity(master, 0.0, 0.0, 0.0, 0.0)
+
+            tag_hover_good = 0
+            tag_x_pid.reset(); tag_y_pid.reset()
+            tag_x_lpf.reset(0.0); tag_y_lpf.reset(0.0)
+
+            tag_vx_slew.reset(0.0); tag_vy_slew.reset(0.0); tag_yr_slew.reset(0.0)
+            last_tag_t = time.time()
             continue
+
+        # 2) Otherwise, line-follow command at 20Hz (no 'continue' gate)
+        now = time.time()
+        send_now = (now - last_cmd_t) >= CMD_DT
         dt = (now - last_cmd_t) if last_cmd_t > 0 else CMD_DT
-        last_cmd_t = now
 
-        h, w = img.shape[:2]
+        if send_now:
+            last_cmd_t = now
+            h, w = img.shape[:2]
 
-        if not m.get("found", False):
-            # If line lost: slow forward, gently yaw to search 
-            vx_cmd = 0.2
-            vy_cmd = 0.0
-            yaw_rate_cmd = 0.35   # gentle spin to reacquire
+            if not m.get("found", False):
+                vx_cmd = 0.2
+                vy_cmd = 0.0
+                yaw_rate_cmd = 0.35
+            else:
+                offset_px = (m["cx"] - (w / 2.0))
+                offset_n = offset_px / (w / 2.0)
+                ang_err = float(m["angle_error_rad"])
+
+                offset_n_f = off_lpf.update(offset_n)
+                ang_err_f = ang_lpf.update(ang_err)
+
+                vy_cmd = lat_pid.update(offset_n_f, dt)
+                yaw_rate_cmd = -yaw_pid.update(ang_err_f, dt)
+
+                err_mag = min(1.0, abs(offset_n_f) + 0.6 * abs(ang_err_f))
+                vx_cmd = FOLLOW_FWD_V * (1.0 - 0.5 * err_mag)
+                if vx_cmd < 0.25:
+                    vx_cmd = 0.25
+
+            vx_cmd = vx_slew.update(vx_cmd, dt)
+            vy_cmd = vy_slew.update(vy_cmd, dt)
+            yaw_rate_cmd = yr_slew.update(yaw_rate_cmd, dt)
+
+            controls.send_body_velocity(master, vx_cmd, vy_cmd, 0.0, yaw_rate_cmd)
+
+    if current_state == DroneState.APRILTAG_01_DETECTED:
+        current_state = DroneState.SCAN_APRILTAG_01
+
+    if current_state == DroneState.SCAN_APRILTAG_01:
+        now = time.time()
+        dt_tag = (now - last_tag_t) if last_tag_t > 0 else CMD_DT
+        last_tag_t = now
+
+        # If tag not visible, hold position and slowly yaw to reacquire
+        if not tag.get("found", False):
+            controls.send_body_velocity(master, 0.0, 0.0, 0.0, 0.25)
+            tag_hover_good = 0
         else:
-            # Normalize offset: -1..+1 (left..right)
-            offset_px = (m["cx"] - (w / 2.0))
-            offset_n = offset_px / (w / 2.0)
+            last_seen_tag = tag
+            h, w = img.shape[:2]
+            cx, cy = tag["center"]
 
-            ang_err = float(m["angle_error_rad"])
+            # normalized errors: left=-, right=+, up=-, down=+
+            ex = (cx - (w / 2.0)) / (w / 2.0)
+            ey = (cy - (h / 2.0)) / (h / 2.0)
 
-            # Filter measurements
-            offset_n_f = off_lpf.update(offset_n)
-            ang_err_f = ang_lpf.update(ang_err)
+            ex_f = tag_x_lpf.update(ex)
+            ey_f = tag_y_lpf.update(ey)
 
-            # Controllers
-            vy_cmd = lat_pid.update(offset_n_f, dt)
+            # Map image errors -> body velocities:
+            # ex (tag to the right) => move right (vy +)
+            vy_cmd = tag_x_pid.update(ex_f, dt_tag)
 
-            yaw_rate_cmd = -yaw_pid.update(ang_err_f, dt)
+            # ey (tag lower in image) usually means it's "behind" depending on camera projection,
+            # but for a downward camera in many sims:
+            # - if tag appears "down" (cy > center), you need to move forward a bit (vx +)
+            vx_cmd = tag_y_pid.update(ey_f, dt_tag)
 
-            # Forward speed scheduling (slow down when large error, for stability)
-            err_mag = min(1.0, abs(offset_n_f) + 0.6 * abs(ang_err_f))
-            vx_cmd = FOLLOW_FWD_V * (1.0 - 0.5 * err_mag)
-            if vx_cmd < 0.25:
-                vx_cmd = 0.25
+            vx_cmd = tag_vx_slew.update(vx_cmd, dt_tag)
+            vy_cmd = tag_vy_slew.update(vy_cmd, dt_tag)
 
-        # Slew-limit commands 
-        vx_cmd = vx_slew.update(vx_cmd, dt)
-        vy_cmd = vy_slew.update(vy_cmd, dt)
-        yaw_rate_cmd = yr_slew.update(yaw_rate_cmd, dt)
+            # Keep yaw steady during centering
+            controls.send_body_velocity(master, vx_cmd, vy_cmd, 0.0, 0.0)
 
-        # Keep vz ~ 0 so autopilot holds altitude
-        controls.send_body_velocity(master, vx_cmd, vy_cmd, 0.0, yaw_rate_cmd)
+            # Check if centered stably
+            if abs(ex_f) < TAG_CENTER_TOL and abs(ey_f) < TAG_CENTER_TOL:
+                tag_hover_good += 1
+            else:
+                tag_hover_good = 0
+
+            if tag_hover_good >= TAG_HOVER_NEED:
+                print(f"AprilTag01 READ ✅ id={tag['id']}")
+
+                # Lock a stop before turning
+                controls.send_body_velocity(master, 0.0, 0.0, 0.0, 0.0)
+
+                # Prepare turn
+                turn_started = False
+                current_state = DroneState.TURN_RIGHT_90
+
+    if current_state == DroneState.TURN_RIGHT_90:
+        msg = master.recv_match(type='ATTITUDE', blocking=False)
+        if not msg:
+            # keep sending a small yaw until we get attitude
+            controls.send_body_velocity(master, 0.0, 0.0, 0.0, 0.3)
+        else:
+            yaw = float(msg.yaw)  # radians, typically [-pi,pi]
+
+            if not turn_started:
+                turn_started = True
+                turn_start_yaw = yaw
+                turn_target_yaw = wrap_pi(turn_start_yaw - (np.pi / 2.0))  # right turn (sign may need flip)
+
+            err = wrap_pi(turn_target_yaw - yaw)
+
+            # simple proportional yaw-rate with clamp
+            yaw_rate_cmd = np.clip(1.2 * err, -0.6, 0.6)
+            controls.send_body_velocity(master, 0.0, 0.0, 0.0, yaw_rate_cmd)
+
+            if abs(err) < 0.06:  # ~3.5 degrees
+                controls.send_body_velocity(master, 0.0, 0.0, 0.0, 0.0)
+                print("Turn 90° right ✅")
+                current_state = DroneState.FOLLOW_LINE_01

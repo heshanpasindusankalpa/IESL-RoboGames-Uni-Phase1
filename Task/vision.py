@@ -138,4 +138,36 @@ def draw_debug(gray_img, measurement, ref_color=(0, 0, 255), line_color=(0, 255,
         cv2.rectangle(vis_img, (x0, 0), (x1, h-1), (80, 80, 80), 1)
 
     return vis_img
-        
+
+def detect_apriltag(gray_img):
+    """
+    Returns:
+      {found: bool, id: int|None, center: (cx,cy)|None, corners: 4x2|None}
+    """
+    try:
+        aruco = cv2.aruco
+    except AttributeError:
+        return {"found": False, "id": None, "center": None, "corners": None}
+
+    dict_id = getattr(aruco, "DICT_APRILTAG_36h11", None)
+    if dict_id is None:
+        return {"found": False, "id": None, "center": None, "corners": None}
+
+    dictionary = aruco.getPredefinedDictionary(dict_id)
+    params = aruco.DetectorParameters()
+
+    if hasattr(aruco, "ArucoDetector"):
+        detector = aruco.ArucoDetector(dictionary, params)
+        corners, ids, _ = detector.detectMarkers(gray_img)
+    else:
+        corners, ids, _ = aruco.detectMarkers(gray_img, dictionary, parameters=params)
+
+    if ids is None or len(ids) == 0:
+        return {"found": False, "id": None, "center": None, "corners": None}
+
+    tag_id = int(ids[0][0])
+    c = corners[0].reshape(4, 2)
+    cx = float(c[:, 0].mean())
+    cy = float(c[:, 1].mean())
+
+    return {"found": True, "id": tag_id, "center": (cx, cy), "corners": c}
