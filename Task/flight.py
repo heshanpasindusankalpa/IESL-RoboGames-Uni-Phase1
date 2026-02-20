@@ -54,6 +54,18 @@ def wrap_pi(a):
     while a < -math.pi: a += 2*math.pi
     return a
 
+
+def tag_inside_roi(tag_measurement, roi):
+    if not tag_measurement.get("found", False) or roi is None:
+        return False
+    cx, cy = tag_measurement["center"]
+    if len(roi) == 2:
+        x0, x1 = roi
+        y0, y1 = 0, float("inf")
+    else:
+        x0, x1, y0, y1 = roi
+    return (x0 <= cx < x1) and (y0 <= cy < y1)
+
 current_state = DroneState.INITIALIZING
 
 ARM_TIMEOUT_S = 5.0
@@ -62,15 +74,21 @@ last_img = None
 last_frame_t = 0.0
 TARGET_ALT = 2.5 # meters
 ALT_TOL = 0.2 # meters
-TAKEOFF_TIMEOUT_S = 20.0
+TAKEOFF_TIMEOUT_S = 35.0
 TAKEOFF_CLIMB_SPEED_MPS = 0.6
 TAKEOFF_ACCEL_Z_MPS2 = 0.8
+TAKEOFF_MIN_ACCEPT_ALT = TARGET_ALT - 0.35
 alt_tracker = controls.AltitudeTracker()
 takeoff_started_at = None
 HOVER_STABILIZE_S = 2.0
 hover_started_at = None
+ALT_LOG_HZ = 2.0
+ALT_LOG_DT = 1.0 / ALT_LOG_HZ
+last_alt_log_t = 0.0
 LINE_THRESH_DEBUG = 155
-LINE_ROI_TOP_RATIO = 0.20
+LINE_ROI_TOP_RATIO_FOLLOW = 0.30
+LINE_ROI_TOP_RATIO_FULL = 1.00
+line_roi_top_ratio_active = LINE_ROI_TOP_RATIO_FOLLOW
 
 # --- Line following ---
 FOLLOW_FWD_V = 0.8        # m/s forward cruise
@@ -112,10 +130,17 @@ tag_y_lpf = controls.LowPass(alpha=0.25)
 tag_hover_good = 0
 TAG_HOVER_NEED = 15         
 TAG_CENTER_TOL = 0.06      
+TAG_BRAKE_S = 0.8
+TAG_YAW_KP = 1.4
+TAG_YAW_RATE_MAX = 0.35
+TAG_YAW_TOL_RAD = 0.08
 
 last_seen_tag = None
 last_tag_t = 0.0
 last_turn_t = 0.0
+last_att_yaw = None
+tag_lock_yaw = None
+tag_lock_started_at = None
 
 tag_vx_slew = controls.SlewRateLimiter(rate_per_s=0.8)
 tag_vy_slew = controls.SlewRateLimiter(rate_per_s=0.8)
@@ -142,10 +167,15 @@ while True:
     if img is None:
         continue
 
+    att_msg = master.recv_match(type='ATTITUDE', blocking=False)
+    while att_msg is not None:
+        last_att_yaw = float(att_msg.yaw)
+        att_msg = master.recv_match(type='ATTITUDE', blocking=False)
+
     m = vision.detect_line(
         img,
         thresh_val=LINE_THRESH_DEBUG,
-        roi_top_ratio=LINE_ROI_TOP_RATIO,
+        roi_top_ratio=line_roi_top_ratio_active,
     )
     tag = vision.detect_apriltag(img)
     vis = vision.draw_debug(img, m)
@@ -187,24 +217,30 @@ while True:
         current_state = DroneState.TAKEOFF
 
     if current_state == DroneState.TAKEOFF:
-        if takeoff_started_at and (time.time() - takeoff_started_at) > TAKEOFF_TIMEOUT_S:
-            print("TAKEOFF timeout — switching to LAND for safety")
-            set_mode('LAND')
-            current_state = DroneState.LANDING
+        reached, current_alt = alt_tracker.update(master, TARGET_ALT, ALT_TOL)
+        now_takeoff = time.time()
+        if current_alt is not None and (now_takeoff - last_alt_log_t) >= ALT_LOG_DT:
+            print(f"Altitude: {current_alt:.2f} m")
+            last_alt_log_t = now_takeoff
 
-        else:
-            reached, current_alt = alt_tracker.update(master, TARGET_ALT, ALT_TOL)
-            if current_alt is not None:
-                print(f"Altitude: {current_alt:.2f} m")
-
-            if reached:
-                print("Reached target altitude — entering HOVER")
+        if reached:
+            print("Reached target altitude — entering HOVER")
+            current_state = DroneState.HOVER
+            hover_started_at = time.time()
+        elif takeoff_started_at and (time.time() - takeoff_started_at) > TAKEOFF_TIMEOUT_S:
+            if current_alt is not None and current_alt >= TAKEOFF_MIN_ACCEPT_ALT:
+                print("TAKEOFF timeout but altitude acceptable — entering HOVER")
                 current_state = DroneState.HOVER
                 hover_started_at = time.time()
+            else:
+                print("TAKEOFF timeout — switching to LAND for safety")
+                set_mode('LAND')
+                current_state = DroneState.LANDING
 
     if current_state == DroneState.HOVER:
         if (time.time() - hover_started_at >= HOVER_STABILIZE_S):
             print("Hover stabilized — ready for FOLLOW_LINE_01")
+            line_roi_top_ratio_active = LINE_ROI_TOP_RATIO_FOLLOW
             follow_started_at = time.time()
             vx_slew.y = 0.0
             vx_slew.inited = True
@@ -215,9 +251,12 @@ while True:
 
     if current_state == DroneState.FOLLOW_LINE_01:
         # 1) Transition ASAP if tag appears (no 20Hz gate)
-        if tag.get("found", False):
+        if tag_inside_roi(tag, m.get("roi")):
             last_seen_tag = tag
             print(f"AprilTag seen while following line: id={tag['id']}")
+            line_roi_top_ratio_active = LINE_ROI_TOP_RATIO_FULL
+            tag_lock_yaw = last_att_yaw
+            tag_lock_started_at = time.time()
             current_state = DroneState.APRILTAG_01_DETECTED
             controls.send_body_velocity(master, 0.0, 0.0, 0.0, 0.0)
 
@@ -280,10 +319,25 @@ while True:
         now = time.time()
         dt_tag = (now - last_tag_t) if last_tag_t > 0 else CMD_DT
         last_tag_t = now
+        lock_elapsed = (now - tag_lock_started_at) if tag_lock_started_at else 0.0
 
-        # If tag not visible, hold position and slowly yaw to reacquire
+        if tag_lock_yaw is None and last_att_yaw is not None:
+            tag_lock_yaw = last_att_yaw
+
+        yaw_err = 0.0
+        yaw_rate_hold = 0.0
+        if tag_lock_yaw is not None and last_att_yaw is not None:
+            yaw_err = wrap_pi(tag_lock_yaw - last_att_yaw)
+            yaw_rate_hold = float(np.clip(TAG_YAW_KP * yaw_err, -TAG_YAW_RATE_MAX, TAG_YAW_RATE_MAX))
+
+        if lock_elapsed < TAG_BRAKE_S:
+            controls.send_body_velocity(master, 0.0, 0.0, 0.0, yaw_rate_hold)
+            tag_hover_good = 0
+            continue
+
+        # If tag not visible, hold position and keep locked heading
         if not tag.get("found", False):
-            controls.send_body_velocity(master, 0.0, 0.0, 0.0, 0.25)
+            controls.send_body_velocity(master, 0.0, 0.0, 0.0, yaw_rate_hold)
             tag_hover_good = 0
         else:
             last_seen_tag = tag
@@ -309,11 +363,11 @@ while True:
             vx_cmd = tag_vx_slew.update(vx_cmd, dt_tag)
             vy_cmd = tag_vy_slew.update(vy_cmd, dt_tag)
 
-            # Keep yaw steady during centering
-            controls.send_body_velocity(master, vx_cmd, vy_cmd, 0.0, 0.0)
+            controls.send_body_velocity(master, vx_cmd, vy_cmd, 0.0, yaw_rate_hold)
 
             # Check if centered stably
-            if abs(ex_f) < TAG_CENTER_TOL and abs(ey_f) < TAG_CENTER_TOL:
+            yaw_ok = abs(yaw_err) < TAG_YAW_TOL_RAD
+            if abs(ex_f) < TAG_CENTER_TOL and abs(ey_f) < TAG_CENTER_TOL and yaw_ok:
                 tag_hover_good += 1
             else:
                 tag_hover_good = 0
@@ -350,6 +404,7 @@ while True:
             if abs(err) < 0.06:  # ~3.5 degrees
                 controls.send_body_velocity(master, 0.0, 0.0, 0.0, 0.0)
                 print("Turn 90° right ✅")
+                line_roi_top_ratio_active = LINE_ROI_TOP_RATIO_FOLLOW
                 follow_started_at = time.time()
                 vx_slew.y = 0.0
                 vx_slew.inited = True

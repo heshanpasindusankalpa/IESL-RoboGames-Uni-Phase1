@@ -44,6 +44,7 @@ class AltitudeTracker:
     def __init__(self):
         self.stable_count = 0
         self.last_alt = None
+        self.stable_needed = 6
 
     def update(self, master, target_alt, tol):
         msg = master.recv_match(type='GLOBAL_POSITION_INT', blocking=False)
@@ -56,7 +57,7 @@ class AltitudeTracker:
         else:
             self.stable_count = 0
 
-        return self.stable_count >= 10, self.last_alt
+        return self.stable_count >= self.stable_needed, self.last_alt
     
 @dataclass
 class PID:
