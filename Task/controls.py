@@ -2,6 +2,15 @@ import time
 from dataclasses import dataclass
 from pymavlink import mavutil
 
+def set_param(master, name: str, value: float):
+    master.mav.param_set_send(
+        master.target_system,
+        master.target_component,
+        name.encode("utf-8"),
+        float(value),
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+    )
+
 def force_arm(master): 
     master.mav.command_long_send(
         master.target_system,
@@ -29,6 +38,7 @@ def takeoff(master, target_alt):
         0, 0,
         target_alt
     )
+
 
 class AltitudeTracker:
     def __init__(self):

@@ -60,13 +60,17 @@ ARM_TIMEOUT_S = 5.0
 arm_requested_at = None
 last_img = None
 last_frame_t = 0.0
-TARGET_ALT = 2.0 # meters
+TARGET_ALT = 2.5 # meters
 ALT_TOL = 0.2 # meters
 TAKEOFF_TIMEOUT_S = 20.0
+TAKEOFF_CLIMB_SPEED_MPS = 0.6
+TAKEOFF_ACCEL_Z_MPS2 = 0.8
 alt_tracker = controls.AltitudeTracker()
 takeoff_started_at = None
 HOVER_STABILIZE_S = 2.0
 hover_started_at = None
+LINE_THRESH_DEBUG = 155
+LINE_ROI_TOP_RATIO = 0.20
 
 # --- Line following ---
 FOLLOW_FWD_V = 0.8        # m/s forward cruise
@@ -74,6 +78,10 @@ MAX_LAT_V = 0.6           # m/s
 MAX_YAW_RATE = 0.8        # rad/s
 CMD_HZ = 20.0             # command rate
 CMD_DT = 1.0 / CMD_HZ
+FOLLOW_START_V = 0.05     # m/s
+FOLLOW_ACCEL_MPS2 = 0.25  # m/s^2 ramp-up
+FOLLOW_YAW_ENABLE_V = 0.45
+FOLLOW_ANGLE_DEADBAND_RAD = math.radians(4.0)
 
 # PID: offset -> lateral velocity, angle -> yaw rate
 lat_pid = controls.PID(kp=0.9, ki=0.0, kd=0.15, out_limit=MAX_LAT_V, i_limit=0.5)
@@ -88,6 +96,7 @@ vy_slew = controls.SlewRateLimiter(rate_per_s=1.2)
 yr_slew = controls.SlewRateLimiter(rate_per_s=2.0)   # rad/s per second
 
 last_cmd_t = 0.0
+follow_started_at = None
 
 # --- AprilTag hover ---
 TAG_MAX_LAT_V = 0.4
@@ -133,13 +142,22 @@ while True:
     if img is None:
         continue
 
-    m = vision.detect_line(img)
+    m = vision.detect_line(
+        img,
+        thresh_val=LINE_THRESH_DEBUG,
+        roi_top_ratio=LINE_ROI_TOP_RATIO,
+    )
     tag = vision.detect_apriltag(img)
     vis = vision.draw_debug(img, m)
 
     cv2.imshow("Webots Camera", vis)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
         break
+    if key == ord('p'):
+        vision.dump_gray_values(img, LINE_THRESH_DEBUG)
+        _, dbg_mask = cv2.threshold(img, LINE_THRESH_DEBUG, 255, cv2.THRESH_BINARY)
+        print(f"mask_white_ratio={(dbg_mask > 0).mean():.4f}")
 
     if current_state == DroneState.INITIALIZING:
         set_mode('GUIDED')
@@ -157,6 +175,9 @@ while True:
                 arm_requested_at = None
 
     if current_state == DroneState.ARMED:
+        controls.set_param(master, "WPNAV_SPEED_UP", TAKEOFF_CLIMB_SPEED_MPS * 100.0)
+        controls.set_param(master, "WPNAV_ACCEL_Z", TAKEOFF_ACCEL_Z_MPS2 * 100.0)
+        time.sleep(0.2)
         controls.takeoff(master, TARGET_ALT)
 
         alt_tracker.stable_count = 0
@@ -184,6 +205,12 @@ while True:
     if current_state == DroneState.HOVER:
         if (time.time() - hover_started_at >= HOVER_STABILIZE_S):
             print("Hover stabilized — ready for FOLLOW_LINE_01")
+            follow_started_at = time.time()
+            vx_slew.y = 0.0
+            vx_slew.inited = True
+            yr_slew.y = 0.0
+            yr_slew.inited = True
+            yaw_pid.reset()
             current_state = DroneState.FOLLOW_LINE_01
 
     if current_state == DroneState.FOLLOW_LINE_01:
@@ -210,11 +237,13 @@ while True:
         if send_now:
             last_cmd_t = now
             h, w = img.shape[:2]
+            follow_elapsed = (now - follow_started_at) if follow_started_at else 0.0
+            ramp_v_max = min(FOLLOW_FWD_V, FOLLOW_START_V + FOLLOW_ACCEL_MPS2 * max(0.0, follow_elapsed))
 
             if not m.get("found", False):
-                vx_cmd = 0.2
+                vx_cmd = min(0.2, ramp_v_max)
                 vy_cmd = 0.0
-                yaw_rate_cmd = 0.35
+                yaw_rate_cmd = 0.0 if ramp_v_max < FOLLOW_YAW_ENABLE_V else 0.2
             else:
                 offset_px = (m["cx"] - (w / 2.0))
                 offset_n = offset_px / (w / 2.0)
@@ -224,12 +253,19 @@ while True:
                 ang_err_f = ang_lpf.update(ang_err)
 
                 vy_cmd = lat_pid.update(offset_n_f, dt)
-                yaw_rate_cmd = -yaw_pid.update(ang_err_f, dt)
+                if abs(ang_err_f) < FOLLOW_ANGLE_DEADBAND_RAD:
+                    ang_err_f = 0.0
+                if ramp_v_max < FOLLOW_YAW_ENABLE_V:
+                    yaw_rate_cmd = 0.0
+                    yaw_pid.reset()
+                else:
+                    yaw_rate_cmd = -yaw_pid.update(ang_err_f, dt)
 
                 err_mag = min(1.0, abs(offset_n_f) + 0.6 * abs(ang_err_f))
                 vx_cmd = FOLLOW_FWD_V * (1.0 - 0.5 * err_mag)
                 if vx_cmd < 0.25:
                     vx_cmd = 0.25
+                vx_cmd = min(vx_cmd, ramp_v_max)
 
             vx_cmd = vx_slew.update(vx_cmd, dt)
             vy_cmd = vy_slew.update(vy_cmd, dt)
@@ -314,4 +350,10 @@ while True:
             if abs(err) < 0.06:  # ~3.5 degrees
                 controls.send_body_velocity(master, 0.0, 0.0, 0.0, 0.0)
                 print("Turn 90° right ✅")
+                follow_started_at = time.time()
+                vx_slew.y = 0.0
+                vx_slew.inited = True
+                yr_slew.y = 0.0
+                yr_slew.inited = True
+                yaw_pid.reset()
                 current_state = DroneState.FOLLOW_LINE_01
