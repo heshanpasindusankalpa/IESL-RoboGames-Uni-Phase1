@@ -7,6 +7,7 @@ import cv2
 from pymavlink import mavutil
 from states import DroneState
 import controls
+from controls import wrap_pi
 import vision
 
 # Establish connections
@@ -49,12 +50,6 @@ def recv_exact(sock, nbytes: int) -> bytes:
         data += chunk
     return data
 
-def wrap_pi(a):
-    while a > math.pi: a -= 2*math.pi
-    while a < -math.pi: a += 2*math.pi
-    return a
-
-
 def tag_inside_roi(tag_measurement, roi):
     if not tag_measurement.get("found", False) or roi is None:
         return False
@@ -91,15 +86,18 @@ LINE_ROI_TOP_RATIO_FULL = 1.00
 line_roi_top_ratio_active = LINE_ROI_TOP_RATIO_FOLLOW
 
 # --- Line following ---
-FOLLOW_FWD_V = 0.8        # m/s forward cruise
+FOLLOW_FWD_V = 0.5        # m/s forward cruise
 MAX_LAT_V = 0.6           # m/s
 MAX_YAW_RATE = 0.8        # rad/s
 CMD_HZ = 20.0             # command rate
 CMD_DT = 1.0 / CMD_HZ
 FOLLOW_START_V = 0.05     # m/s
-FOLLOW_ACCEL_MPS2 = 0.25  # m/s^2 ramp-up
+FOLLOW_ACCEL_MPS2 = 0.18  # m/s^2 ramp-up
 FOLLOW_YAW_ENABLE_V = 0.45
 FOLLOW_ANGLE_DEADBAND_RAD = math.radians(4.0)
+PITCH_SOFT_LIMIT_RAD = math.radians(8.0)   # start scaling down vx
+PITCH_HARD_LIMIT_RAD = math.radians(15.0)  # hard cap vx to 0.10
+PITCH_RATE_SOFT_RAD_S = math.radians(20.0) # scale down if pitching fast
 
 # PID: offset -> lateral velocity, angle -> yaw rate
 lat_pid = controls.PID(kp=0.9, ki=0.0, kd=0.15, out_limit=MAX_LAT_V, i_limit=0.5)
@@ -109,42 +107,68 @@ yaw_pid = controls.PID(kp=1.8, ki=0.0, kd=0.25, out_limit=MAX_YAW_RATE, i_limit=
 off_lpf = controls.LowPass(alpha=0.25)
 ang_lpf = controls.LowPass(alpha=0.25)
 
-vx_slew = controls.SlewRateLimiter(rate_per_s=1.5)   # m/s per second
+vx_slew = controls.SlewRateLimiter(rate_per_s=0.45)   # m/s per second
 vy_slew = controls.SlewRateLimiter(rate_per_s=1.2)
 yr_slew = controls.SlewRateLimiter(rate_per_s=2.0)   # rad/s per second
 
 last_cmd_t = 0.0
 follow_started_at = None
+last_vx_cmd = 0.0
+last_vy_cmd = 0.0
 
 # --- AprilTag hover ---
-TAG_MAX_LAT_V = 0.4
-TAG_MAX_FWD_V = 0.4
-TAG_MAX_YAW_RATE = 0.6
+TAG_MAX_LAT_V = 0.2
+TAG_MAX_FWD_V = 0.2
+TAG_MAX_YAW_RATE = 0.4
 
-tag_x_pid = controls.PID(kp=0.8, ki=0.0, kd=0.12, out_limit=TAG_MAX_LAT_V, i_limit=0.4)  
-tag_y_pid = controls.PID(kp=0.8, ki=0.0, kd=0.12, out_limit=TAG_MAX_FWD_V, i_limit=0.4) 
+tag_x_pid = controls.PID(kp=0.35, ki=0.02, kd=0.25, out_limit=TAG_MAX_LAT_V, i_limit=0.2)  
+tag_y_pid = controls.PID(kp=0.35, ki=0.02, kd=0.25, out_limit=TAG_MAX_FWD_V, i_limit=0.2) 
 
-tag_x_lpf = controls.LowPass(alpha=0.25)
-tag_y_lpf = controls.LowPass(alpha=0.25)
+tag_x_lpf = controls.LowPass(alpha=0.1)
+tag_y_lpf = controls.LowPass(alpha=0.1)
 
 tag_hover_good = 0
-TAG_HOVER_NEED = 15         
-TAG_CENTER_TOL = 0.06      
-TAG_BRAKE_S = 0.8
-TAG_YAW_KP = 1.4
-TAG_YAW_RATE_MAX = 0.35
-TAG_YAW_TOL_RAD = 0.08
+TAG_HOVER_NEED = 20         
+TAG_CENTER_TOL = 0.1     
+TAG_STOP_TOL = 0.07
+TAG_BRAKE_S = 1.5
+TAG_YAW_KP = 0.8
+TAG_YAW_RATE_MAX = 0.25
+TAG_YAW_TOL_RAD = 0.1
+TAG_EY_TO_VX_SIGN = -1.0
+TAG_REACQ_MAX_S = 1.2
+TAG_REACQ_GAIN = 0.3
+TAG_PITCH_HOLD_RAD = math.radians(3.5)
+TAG_PITCH_RATE_HOLD_RAD_S = math.radians(8.0)
+TAG_STABLE_VXY_TOL = 0.08
+TAG_STABLE_VZ_TOL = 0.06
+TAG_STABLE_RATE_TOL_RAD_S = math.radians(8.0)
+TAG_STABLE_NEED = 14
 
 last_seen_tag = None
+last_att_pitch = None
+last_seen_tag_t = 0.0
 last_tag_t = 0.0
 last_turn_t = 0.0
 last_att_yaw = None
+last_att_roll_rate = None
+last_att_pitch_rate = None
+last_att_yaw_rate = None
+last_local_vx = None
+last_local_vy = None
+last_local_vz = None
 tag_lock_yaw = None
 tag_lock_started_at = None
 
-tag_vx_slew = controls.SlewRateLimiter(rate_per_s=0.8)
-tag_vy_slew = controls.SlewRateLimiter(rate_per_s=0.8)
-tag_yr_slew = controls.SlewRateLimiter(rate_per_s=1.5)
+tag_vx_slew = controls.SlewRateLimiter(rate_per_s=0.2)
+tag_vy_slew = controls.SlewRateLimiter(rate_per_s=0.2)
+tag_yr_slew = controls.SlewRateLimiter(rate_per_s=0.8)
+tag_stability = controls.AxisStabilityChecker(
+    vxy_tol=TAG_STABLE_VXY_TOL,
+    vz_tol=TAG_STABLE_VZ_TOL,
+    rate_tol=TAG_STABLE_RATE_TOL_RAD_S,
+    stable_needed=TAG_STABLE_NEED,
+)
 
 # --- Turn tracking ---
 turn_started = False
@@ -170,15 +194,48 @@ while True:
     att_msg = master.recv_match(type='ATTITUDE', blocking=False)
     while att_msg is not None:
         last_att_yaw = float(att_msg.yaw)
+        last_att_pitch = float(att_msg.pitch)
+        last_att_pitch_rate = float(att_msg.pitchspeed)
         att_msg = master.recv_match(type='ATTITUDE', blocking=False)
 
-    m = vision.detect_line(
-        img,
-        thresh_val=LINE_THRESH_DEBUG,
-        roi_top_ratio=line_roi_top_ratio_active,
-    )
     tag = vision.detect_apriltag(img)
-    vis = vision.draw_debug(img, m)
+    line_tracking_active = (current_state == DroneState.FOLLOW_LINE_01)
+    if line_tracking_active:
+        m = vision.detect_line(
+            img,
+            thresh_val=LINE_THRESH_DEBUG,
+            roi_top_ratio=line_roi_top_ratio_active,
+        )
+        vis = vision.draw_debug(img, m)
+    else:
+        m = {"found": False, "cx": None, "cy": None, "angle_rad": None, "angle_error_rad": None, "roi": None}
+        vis = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        if tag.get("found", False):
+            corners = tag.get("corners")
+            if corners is not None:
+                pts = corners.astype(np.int32).reshape((-1, 1, 2))
+                cv2.polylines(vis, [pts], True, (0, 255, 0), 2)
+            tcx, tcy = tag["center"]
+            cv2.circle(vis, (int(tcx), int(tcy)), 4, (0, 255, 255), -1)
+            cv2.putText(
+                vis,
+                f"TAG id={tag['id']}",
+                (20, 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (0, 255, 0),
+                2,
+            )
+        else:
+            cv2.putText(
+                vis,
+                "TAG SEARCH",
+                (20, 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (0, 220, 255),
+                2,
+            )
 
     cv2.imshow("Webots Camera", vis)
     key = cv2.waitKey(1) & 0xFF
@@ -258,13 +315,15 @@ while True:
             tag_lock_yaw = last_att_yaw
             tag_lock_started_at = time.time()
             current_state = DroneState.APRILTAG_01_DETECTED
-            controls.send_body_velocity(master, 0.0, 0.0, 0.0, 0.0)
+            tag_vx_slew.y = last_vx_cmd
+            tag_vx_slew.inited = True
+            tag_vy_slew.y = last_vy_cmd
+            tag_vy_slew.inited = True
 
             tag_hover_good = 0
             tag_x_pid.reset(); tag_y_pid.reset()
             tag_x_lpf.reset(0.0); tag_y_lpf.reset(0.0)
 
-            tag_vx_slew.reset(0.0); tag_vy_slew.reset(0.0); tag_yr_slew.reset(0.0)
             last_tag_t = time.time()
             continue
 
@@ -306,11 +365,23 @@ while True:
                     vx_cmd = 0.25
                 vx_cmd = min(vx_cmd, ramp_v_max)
 
+            if last_att_pitch is not None:
+                pitch_abs = abs(last_att_pitch)
+                if pitch_abs >= PITCH_HARD_LIMIT_RAD:
+                    vx_cmd = min(vx_cmd, 0.10)
+                elif pitch_abs > PITCH_SOFT_LIMIT_RAD:
+                    p = (pitch_abs - PITCH_SOFT_LIMIT_RAD) / (PITCH_HARD_LIMIT_RAD - PITCH_SOFT_LIMIT_RAD)
+                    vx_cmd *= max(0.2, 1.0 - p)
+            if last_att_pitch_rate is not None and abs(last_att_pitch_rate) > PITCH_RATE_SOFT_RAD_S:
+                vx_cmd *= 0.7
+
             vx_cmd = vx_slew.update(vx_cmd, dt)
             vy_cmd = vy_slew.update(vy_cmd, dt)
             yaw_rate_cmd = yr_slew.update(yaw_rate_cmd, dt)
 
             controls.send_body_velocity(master, vx_cmd, vy_cmd, 0.0, yaw_rate_cmd)
+            last_vx_cmd = vx_cmd
+            last_vy_cmd = vy_cmd
 
     if current_state == DroneState.APRILTAG_01_DETECTED:
         current_state = DroneState.SCAN_APRILTAG_01
@@ -320,6 +391,11 @@ while True:
         dt_tag = (now - last_tag_t) if last_tag_t > 0 else CMD_DT
         last_tag_t = now
         lock_elapsed = (now - tag_lock_started_at) if tag_lock_started_at else 0.0
+        pitch_unstable = False
+        if last_att_pitch is not None and abs(last_att_pitch) > TAG_PITCH_HOLD_RAD:
+            pitch_unstable = True
+        if last_att_pitch_rate is not None and abs(last_att_pitch_rate) > TAG_PITCH_RATE_HOLD_RAD_S:
+            pitch_unstable = True
 
         if tag_lock_yaw is None and last_att_yaw is not None:
             tag_lock_yaw = last_att_yaw
@@ -331,16 +407,40 @@ while True:
             yaw_rate_hold = float(np.clip(TAG_YAW_KP * yaw_err, -TAG_YAW_RATE_MAX, TAG_YAW_RATE_MAX))
 
         if lock_elapsed < TAG_BRAKE_S:
-            controls.send_body_velocity(master, 0.0, 0.0, 0.0, yaw_rate_hold)
+            vx_cmd = tag_vx_slew.update(0.0, dt_tag)
+            vy_cmd = tag_vy_slew.update(0.0, dt_tag)
+            controls.send_body_velocity(master, vx_cmd, vy_cmd, 0.0, yaw_rate_hold)
+            last_vx_cmd = vx_cmd
+            last_vy_cmd = vy_cmd
             tag_hover_good = 0
             continue
 
         # If tag not visible, hold position and keep locked heading
         if not tag.get("found", False):
-            controls.send_body_velocity(master, 0.0, 0.0, 0.0, yaw_rate_hold)
+            if last_seen_tag is not None and (now - last_seen_tag_t) <= TAG_REACQ_MAX_S:
+                h, w = img.shape[:2]
+                cx, cy = last_seen_tag["center"]
+                ex_mem = (cx - (w / 2.0)) / (w / 2.0)
+                ey_mem = (cy - (h / 2.0)) / (h / 2.0)
+
+                vy_cmd = np.clip(TAG_REACQ_GAIN * ex_mem, -TAG_MAX_LAT_V * 0.5, TAG_MAX_LAT_V * 0.5)
+                vx_cmd = np.clip(TAG_REACQ_GAIN * TAG_EY_TO_VX_SIGN * ey_mem, -TAG_MAX_FWD_V * 0.5, TAG_MAX_FWD_V * 0.5)
+                if pitch_unstable:
+                    vx_cmd = 0.0
+
+                vx_cmd = tag_vx_slew.update(vx_cmd, dt_tag)
+                vy_cmd = tag_vy_slew.update(vy_cmd, dt_tag)
+                controls.send_body_velocity(master, vx_cmd, vy_cmd, 0.0, yaw_rate_hold)
+                last_vx_cmd = vx_cmd
+                last_vy_cmd = vy_cmd
+            else:
+                controls.send_body_velocity(master, 0.0, 0.0, 0.0, yaw_rate_hold)
+                last_vx_cmd = 0.0
+                last_vy_cmd = 0.0
             tag_hover_good = 0
         else:
             last_seen_tag = tag
+            last_seen_tag_t = now
             h, w = img.shape[:2]
             cx, cy = tag["center"]
 
@@ -351,19 +451,31 @@ while True:
             ex_f = tag_x_lpf.update(ex)
             ey_f = tag_y_lpf.update(ey)
 
-            # Map image errors -> body velocities:
-            # ex (tag to the right) => move right (vy +)
-            vy_cmd = tag_x_pid.update(ex_f, dt_tag)
+            vy_cmd = 0.0 if abs(ex_f) < TAG_STOP_TOL else tag_x_pid.update(ex_f, dt_tag)
 
-            # ey (tag lower in image) usually means it's "behind" depending on camera projection,
-            # but for a downward camera in many sims:
-            # - if tag appears "down" (cy > center), you need to move forward a bit (vx +)
-            vx_cmd = tag_y_pid.update(ey_f, dt_tag)
+            # Pitch-proportional forward velocity damping
+            # Even mild pitch suppresses vx so the swing can't amplify
+            pitch_abs = abs(last_att_pitch) if last_att_pitch is not None else 0.0
+            pitch_rate_abs = abs(last_att_pitch_rate) if last_att_pitch_rate is not None else 0.0
+
+            pitch_suppress = max(0.0, 1.0 - (pitch_abs / TAG_PITCH_HOLD_RAD) * 1.5)
+            pitch_suppress = min(1.0, pitch_suppress)
+            if pitch_rate_abs > math.radians(5.0):
+                pitch_suppress *= 0.3   # extra damping if pitch is actively moving
+
+            if pitch_unstable:
+                vx_cmd = 0.0
+                tag_y_pid.reset()
+            else:
+                raw_vx = 0.0 if abs(ey_f) < TAG_STOP_TOL else (TAG_EY_TO_VX_SIGN * tag_y_pid.update(ey_f, dt_tag))
+                vx_cmd = raw_vx * pitch_suppress   # smoothly suppress based on current pitch
 
             vx_cmd = tag_vx_slew.update(vx_cmd, dt_tag)
             vy_cmd = tag_vy_slew.update(vy_cmd, dt_tag)
 
             controls.send_body_velocity(master, vx_cmd, vy_cmd, 0.0, yaw_rate_hold)
+            last_vx_cmd = vx_cmd
+            last_vy_cmd = vy_cmd
 
             # Check if centered stably
             yaw_ok = abs(yaw_err) < TAG_YAW_TOL_RAD

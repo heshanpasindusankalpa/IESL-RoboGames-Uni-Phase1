@@ -1,4 +1,5 @@
 import time
+import math
 from dataclasses import dataclass
 from pymavlink import mavutil
 
@@ -10,6 +11,13 @@ def set_param(master, name: str, value: float):
         float(value),
         mavutil.mavlink.MAV_PARAM_TYPE_REAL32
     )
+
+def wrap_pi(a: float) -> float:
+    while a > math.pi:
+        a -= 2.0 * math.pi
+    while a < -math.pi:
+        a += 2.0 * math.pi
+    return a
 
 def force_arm(master): 
     master.mav.command_long_send(
@@ -144,6 +152,76 @@ class SlewRateLimiter:
         if delta < -max_step: delta = -max_step
         self.y += delta
         return self.y
+
+
+@dataclass
+class AxisStabilityChecker:
+    vxy_tol: float
+    vz_tol: float
+    rate_tol: float
+    stable_needed: int
+
+    def __post_init__(self):
+        self.count = 0
+
+    def reset(self):
+        self.count = 0
+
+    def update(self, vx, vy, vz, roll_rate, pitch_rate, yaw_rate) -> bool:
+        samples = (vx, vy, vz, roll_rate, pitch_rate, yaw_rate)
+        if any(v is None for v in samples):
+            self.count = 0
+            return False
+
+        stable = (
+            abs(vx) <= self.vxy_tol and
+            abs(vy) <= self.vxy_tol and
+            abs(vz) <= self.vz_tol and
+            abs(roll_rate) <= self.rate_tol and
+            abs(pitch_rate) <= self.rate_tol and
+            abs(yaw_rate) <= self.rate_tol
+        )
+
+        if stable:
+            self.count += 1
+        else:
+            self.count = 0
+        return self.count >= self.stable_needed
+
+
+def yaw_hold_rate(target_yaw, current_yaw, kp: float, max_rate: float) -> float:
+    if target_yaw is None or current_yaw is None:
+        return 0.0
+    err = wrap_pi(target_yaw - current_yaw)
+    return float(max(-max_rate, min(max_rate, kp * err)))
+
+
+def ramp_xy_to_stop(vx_slew: SlewRateLimiter, vy_slew: SlewRateLimiter, dt: float):
+    return vx_slew.update(0.0, dt), vy_slew.update(0.0, dt)
+
+
+def tag_xy_commands(
+    ex: float,
+    ey: float,
+    dt: float,
+    x_pid: PID,
+    y_pid: PID,
+    x_lpf: LowPass,
+    y_lpf: LowPass,
+    vx_slew: SlewRateLimiter,
+    vy_slew: SlewRateLimiter,
+    stop_tol: float,
+    ey_to_vx_sign: float,
+):
+    ex_f = x_lpf.update(ex)
+    ey_f = y_lpf.update(ey)
+
+    vy_cmd = 0.0 if abs(ex_f) < stop_tol else x_pid.update(ex_f, dt)
+    vx_raw = 0.0 if abs(ey_f) < stop_tol else (ey_to_vx_sign * y_pid.update(ey_f, dt))
+
+    vx_cmd = vx_slew.update(vx_raw, dt)
+    vy_cmd = vy_slew.update(vy_cmd, dt)
+    return vx_cmd, vy_cmd, ex_f, ey_f
 
 
 def send_body_velocity(master, vx: float, vy: float, vz: float, yaw_rate: float):
