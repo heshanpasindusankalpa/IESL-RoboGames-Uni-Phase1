@@ -310,7 +310,7 @@ while True:
         elif turn_phase == "align":
             # Rotate back to the original line-following heading
             err          = wrap_pi(turn_base_yaw - att_yaw)
-            yaw_rate_cmd = float(np.clip(1.2 * err, -0.6, 0.6))
+            yaw_rate_cmd = float(np.clip(1.2 * err, -0.3, 0.3))
             controls.send_body_velocity(master, 0.0, 0.0, 0.0, yaw_rate_cmd)
 
             if abs(err) < HEADING_ALIGN_TOL_RAD:
